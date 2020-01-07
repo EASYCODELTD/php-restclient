@@ -28,8 +28,9 @@ class RestClient implements Iterator, ArrayAccess {
             'headers' => [], 
             'parameters' => [], 
             'curl_options' => [], 
-            'build_indexed_queries' => FALSE, 
-            'user_agent' => "PHP RestClient/0.1.7", 
+            'build_indexed_queries' => FALSE,
+            'version' => "0.1.7", 
+            'user_agent' => "RestClient (eCMF)/0.1.7", 
             'base_url' => NULL, 
             'format' => NULL, 
             'format_regex' => "/(\w+)\/(\w+)(;[.+])?/",
@@ -38,7 +39,8 @@ class RestClient implements Iterator, ArrayAccess {
                 'php' => 'unserialize'
             ], 
             'username' => NULL, 
-            'password' => NULL
+            'password' => NULL,
+            'debug' => false,
         ];
         
         $this->options = array_merge($default_options, $options);
@@ -130,18 +132,34 @@ class RestClient implements Iterator, ArrayAccess {
     }
     
     public function execute($url, $method='GET', $parameters=[], $headers=[]){
+                
+            
+        $headers = $headers + ['X-CLIENT-IP' => (!empty($_SERVER['HTTP_CLIENT_IP'])?$_SERVER['HTTP_CLIENT_IP']:(!empty($_SERVER['HTTP_X_FORWARDED_FOR'])?$_SERVER['HTTP_X_FORWARDED_FOR']:(isset($_SERVER['REMOTE_ADDR'])?$_SERVER['REMOTE_ADDR']:'127.0.0.1')))];
+        
         $client = clone $this;
         $client->url = $url;
         $client->handle = curl_init();
         $curlopt = [
             CURLOPT_HEADER => TRUE, 
             CURLOPT_RETURNTRANSFER => TRUE, 
-            CURLOPT_USERAGENT => $client->options['user_agent']
+            CURLOPT_USERAGENT => $client->options['user_agent'],
+            CURLOPT_SSL_VERIFYPEER => FALSE,
+            CURLOPT_SSL_VERIFYHOST => FALSE,
+            CURLINFO_HEADER_OUT => TRUE,
+            CURLOPT_HTTP_VERSION   => (defined('CURL_VERSION_HTTP2') && CURL_VERSION_HTTP2?CURL_VERSION_HTTP2:3),
         ];
         
-        if($client->options['username'] && $client->options['password'])
-            $curlopt[CURLOPT_USERPWD] = sprintf("%s:%s", 
-                $client->options['username'], $client->options['password']);
+        if($client->options['username'] && $client->options['password']) {
+            $curlopt[CURLOPT_USERPWD] = sprintf("%s:%s",$client->options['username'], $client->options['password']);
+            $curlopt[CURLOPT_HTTPAUTH] = CURLAUTH_BASIC;
+        }
+        
+        if(strtoupper($method) == 'POST'){
+            $headers['Content-Type'] = 'application/json';
+        }
+        elseif(strtoupper($method) == 'PUT'){
+            $headers['Content-Type'] = 'application/json';
+        }
         
         if(count($client->options['headers']) || count($headers)){
             $curlopt[CURLOPT_HTTPHEADER] = [];
@@ -153,22 +171,33 @@ class RestClient implements Iterator, ArrayAccess {
             }
         }
         
-        if($client->options['format'])
-            $client->url .= '.'.$client->options['format'];
-        
+        //if($client->options['format']) $client->url .= '.'.$client->options['format'];
+         //error_log("=================================================");
+         //error_log("URL: ".$url);
+         //error_log("METHOD: ".$method);
+         //error_log("=================================================");
+         //error_log(print_r($parameters,true));
+        // error_log("=================================================");
+                
         // Allow passing parameters as a pre-encoded string (or something that
         // allows casting to a string). Parameters passed as strings will not be
         // merged with parameters specified in the default options.
         if(is_array($parameters)){
             $parameters = array_merge($client->options['parameters'], $parameters);
-            $parameters_string = http_build_query($parameters);
             
-            // http_build_query automatically adds an array index to repeated
-            // parameters which is not desirable on most systems. This hack
-            // reverts "key[0]=foo&key[1]=bar" to "key[]=foo&key[]=bar"
-            if(!$client->options['build_indexed_queries'])
-                $parameters_string = preg_replace(
-                    "/%5B[0-9]+%5D=/simU", "%5B%5D=", $parameters_string);
+            if(strtoupper($method) != 'POST' && strtoupper($method) != 'PUT' ){
+                $parameters_string = http_build_query($parameters);
+                
+                // http_build_query automatically adds an array index to repeated
+                // parameters which is not desirable on most systems. This hack
+                // reverts "key[0]=foo&key[1]=bar" to "key[]=foo&key[]=bar"
+                if(!$client->options['build_indexed_queries'])
+                    $parameters_string = preg_replace(
+                        "/%5B[0-9]+%5D=/simU", "%5B%5D=", $parameters_string);
+            } else {
+                
+                $parameters_string = json_encode($parameters);
+            }
         }
         else
             $parameters_string = (string) $parameters;
@@ -201,9 +230,31 @@ class RestClient implements Iterator, ArrayAccess {
         }
         curl_setopt_array($client->handle, $curlopt);
         
-        $client->parse_response(curl_exec($client->handle));
+        $response = curl_exec($client->handle);
+        
+                        
+        $client->parse_response($response);
         $client->info = (object) curl_getinfo($client->handle);
         $client->error = curl_error($client->handle);
+        $client->info->curlVersion = curl_version()["version"];
+        
+        
+        if (curl_version()["features"] && defined('CURL_VERSION_HTTP2') && CURL_VERSION_HTTP2 !== 0) {
+            $client->info->http2Support = true;
+        } else {
+            $client->info->http2Support = false;
+        }
+            
+        
+        if((strpos(join(' ',$client->response_status_lines),'HTTP/2')!==false)) {
+            $client->info->protocol = 'HTTP/2';
+            $client->info->http2Support = true;
+        } else {
+            $client->info->protocol = 'HTTP/1';
+        }     
+        
+         
+        
         
         curl_close($client->handle);
         return $client;
@@ -242,6 +293,7 @@ class RestClient implements Iterator, ArrayAccess {
     }
     
     public function get_response_format(){
+        return 'json';
         if(!$this->response)
             throw new RestClientException(
                 "A response must exist before it can be decoded.");
